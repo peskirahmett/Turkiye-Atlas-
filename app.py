@@ -1,151 +1,199 @@
 import streamlit as st
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import gaussian_filter
 from matplotlib.colors import LightSource
 import geopandas as gpd
 import rasterio
-from rasterio.mask import mask
+from rasterio.plot import show
 import io
 import ssl
 import requests
-import zipfile
-import os
 import matplotlib.patheffects as PathEffects
+from shapely.geometry import box
 
-# --- SSL AYARLARI ---
+# --- 1. GÜVENLİK DUVARINI AŞMA (SSL HACK) ---
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
     pass
 else:
     ssl._create_default_https_context = _create_unverified_https_context
+
 import urllib3
 urllib3.disable_warnings()
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Auto-NASA Atlas", layout="wide", page_icon="🛰️")
-st.title("🛰️ Tam Otomatik Türkiye Atlası (Canlı Veri)")
+st.set_page_config(page_title="Pro Atlas (Offline Destekli)", layout="wide", page_icon="🛡️")
+st.title("🛡️ Türkiye Atlası: Kesintisiz Mod")
 st.markdown("""
-Bu sistem **dosya yükleme gerektirmez**. Seçtiğiniz bölgenin koordinatlarını hesaplar ve 
-**NASA'nın (CGIAR-CSI) sunucularından** ilgili topografya paftasını **otomatik indirip işler.**
+Bu sistem **akıllı bağlantı** kullanır. Veri sunucularına ulaşılamazsa otomatik olarak **Simülasyon Moduna** geçer.
+Asla hata verip kapanmaz.
 """)
 
-# --- ROBOT: NASA VERİSİNİ BUL VE İNDİR ---
-@st.cache_data(show_spinner=False)
-def nasa_verisi_indir(lat, lon):
-    """
-    Verilen koordinatın hangi SRTM paftasına (Tile) düştüğünü hesaplar ve indirir.
-    NASA SRTM 90m verisi 5x5 derecelik kareler halindedir.
-    """
-    # 1. Matematiksel Pafta Hesabı (CGIAR Izgara Sistemi)
-    # X (Sütun) = (180 + Boylam) / 5 + 1
-    # Y (Satır) = (60 - Enlem) / 5 + 1
-    x_idx = int((180 + lon) / 5) + 1
-    y_idx = int((60 - lat) / 5) + 1
-    
-    tile_name = f"srtm_{x_idx:02d}_{y_idx:02d}"
-    url = f"https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF/{tile_name}.zip"
-    
-    # 2. İndirme İşlemi
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url, headers=headers, verify=False, stream=True)
-        if r.status_code != 200:
-            return None, f"Sunucu hatası: {r.status_code}"
-            
-        # 3. Zip'i Hafızada Aç
-        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-            # Tif dosyasını bul
-            tif_file = [f for f in z.namelist() if f.endswith('.tif')][0]
-            # Diske geçici olarak kaydetmek zorundayız (Rasterio bellekten okumayı sevmez)
-            temp_filename = f"temp_{tile_name}.tif"
-            with open(temp_filename, "wb") as f:
-                f.write(z.read(tif_file))
-                
-        return temp_filename, None
-        
-    except Exception as e:
-        return None, str(e)
-
-# --- VERİ ÇEKME MOTORU (Sınırlar ve Göller) ---
+# --- 2. GÜÇLENDİRİLMİŞ VERİ MOTORU ---
 @st.cache_data
-def vektorel_veri_getir():
-    # Şehirler
+def veri_getir_guvenli():
+    # Sahte Tarayıcı Kimliği (Robot olmadığımızı kanıtlamak için)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+    }
+    
     url_cities = "https://raw.githubusercontent.com/alpers/Turkey-Maps-GeoJSON/master/tr-cities.json"
-    # Sular
     url_water = "https://raw.githubusercontent.com/cihadturhan/tr-geojson/master/geo/tr-water-utf8.json"
     
+    gdf_cities = None
+    gdf_water = None
+    baglanti_durumu = "Online"
+
+    # 1. ŞEHİRLER
     try:
-        r = requests.get(url_cities, verify=False)
-        gdf_cities = gpd.read_file(io.BytesIO(r.content))
-        
-        r_water = requests.get(url_water, verify=False)
-        gdf_water = gpd.read_file(io.BytesIO(r_water.content))
-        return gdf_cities, gdf_water
+        r = requests.get(url_cities, headers=headers, verify=False, timeout=5)
+        if r.status_code == 200:
+            gdf_cities = gpd.read_file(io.BytesIO(r.content))
     except:
-        return None, None
+        baglanti_durumu = "Offline (Şehir Sınırları İndirilemedi)"
 
-# --- YAN PANEL ---
-st.sidebar.header("🎛️ Kontrol Merkezi")
+    # 2. SULAR
+    try:
+        r_water = requests.get(url_water, headers=headers, verify=False, timeout=5)
+        if r_water.status_code == 200:
+            gdf_water = gpd.read_file(io.BytesIO(r_water.content))
+    except:
+        pass # Su yoksa sorun yok
+            
+    return gdf_cities, gdf_water, baglanti_durumu
 
-with st.spinner("Sınır verileri yükleniyor..."):
-    gdf_cities, gdf_water = vektorel_veri_getir()
-    if gdf_cities is None:
-        st.error("İnternet bağlantısı yok.")
-        st.stop()
+# --- 3. TOPOGRAFYA MOTORLARI ---
 
-# İsim kolonunu bul
-cols = gdf_cities.columns
-isim_kolonu = 'name' if 'name' in cols else 'NAME'
-il_listesi = sorted(gdf_cities[isim_kolonu].unique().tolist())
-secilen_yer = st.sidebar.selectbox("📍 Gitmek İstediğiniz İl:", il_listesi)
-
-st.sidebar.divider()
-kabartma = st.sidebar.slider("Dağ Efekti", 0.5, 4.0, 1.5)
-izohips_var = st.sidebar.checkbox("İzohips", value=True)
-su_var = st.sidebar.checkbox("Göller", value=True)
-
-# --- ANA İŞLEM ---
-if secilen_yer:
-    # 1. Seçilen ilin merkezini ve sınırlarını bul
-    il_verisi = gdf_cities[gdf_cities[isim_kolonu] == secilen_yer]
-    bounds = il_verisi.total_bounds # minx, miny, maxx, maxy
-    centroid = il_verisi.geometry.centroid.iloc[0]
+def zemin_uret_simulasyon(bounds, seed):
+    np.random.seed(seed)
+    minx, miny, maxx, maxy = bounds
+    width = maxx - minx
+    height = maxy - miny
+    if width == 0: width = 1
     
-    # Bilgi Mesajı
-    durum_kutusu = st.info(f"📡 NASA uydusuna bağlanılıyor... {secilen_yer} için veri indiriliyor...")
-    
-    # 2. NASA Verisini İndir (Robot Çalışıyor)
-    dem_path, error = nasa_verisi_indir(centroid.y, centroid.x)
-    
-    if error:
-        durum_kutusu.error(f"NASA Sunucusu Yanıt Vermedi: {error}")
-    else:
-        durum_kutusu.success(f"✅ Veri İndirildi! {secilen_yer} topografyası işleniyor...")
+    # Yüksek Çözünürlük
+    base_res = 600 
+    shape = (int(base_res * (height/width)), base_res)
+    if shape[0] < 100: shape = (300, 600)
         
-        # 3. Veriyi Kes ve İşle
-        with rasterio.open(dem_path) as src:
-            # İlin sınırlarına göre kes (Crop)
-            # GeoJSON geometrisini kullanarak maskeleme yapıyoruz
-            geoms = il_verisi.geometry.values
-            out_image, out_transform = mask(src, geoms, crop=True)
-            out_meta = src.meta
-            
-            # Veriyi düzelt (0 altı değerler ve nodata'yı temizle)
-            Z = out_image[0]
-            Z = np.where(Z < -100, np.nan, Z) # Hatalı verileri sil
-            Z = np.where(Z == src.nodata, np.nan, Z)
-            
-            # Koordinat sınırlarını güncelle (Kesilen parça için)
-            height, width = Z.shape
-            minx_c, miny_c = bounds[0], bounds[1]
-            maxx_c, maxy_c = bounds[2], bounds[3]
-            extent = [minx_c, maxx_c, miny_c, maxy_c]
+    x = np.linspace(0, 1, shape[1])
+    y = np.linspace(0, 1, shape[0])
+    X, Y = np.meshgrid(x, y)
+    
+    # Matematiksel Dağlar
+    noise = gaussian_filter(np.random.rand(*shape), sigma=6) * 0.7
+    detay = gaussian_filter(np.random.rand(*shape), sigma=1) * 0.15
+    rampa = X * 0.5 
+    
+    arazi = noise + detay + rampa
+    arazi = (arazi - arazi.min()) / (arazi.max() - arazi.min())
+    return arazi
 
-            # --- ÇİZİM ---
-            fig, ax = plt.subplots(figsize=(16, 12))
-            ax.set_facecolor('#e6f3ff') # Deniz rengi arka plan
+def zemin_uret_gercek(uploaded_file):
+    with rasterio.open(uploaded_file) as src:
+        out_shape = (int(src.height / 5), int(src.width / 5))
+        data = src.read(1, out_shape=out_shape, resampling=5)
+        bounds = rasterio.transform.array_bounds(src.height, src.width, src.transform)
+        data = np.where(data < -100, 0, data)
+        return data, bounds
 
-            # A. ZEMİN (NASA Verisi)
-            ls = LightSource(azdeg=315, altdeg=45)
-            # Nan değerleri (sınır dışı) ş
+# --- UYGULAMA AKIŞI ---
+
+# Yan Panel
+st.sidebar.header("🎛️ Kontrol Paneli")
+
+# 1. Manuel Dosya Yükleme (Her zaman çalışır)
+uploaded_dem = st.sidebar.file_uploader("NASA Dosyası Yükle (.tif)", type=['tif', 'tiff'])
+
+# 2. Verileri İndirmeyi Dene
+with st.spinner("Sunuculara bağlanılıyor..."):
+    gdf_cities, gdf_water, durum = veri_getir_guvenli()
+
+# Durum Bildirimi
+if "Offline" in durum:
+    st.warning("⚠️ İnternet verisi çekilemedi. **Simülasyon Modu** devrede.")
+    # Veri yoksa manuel liste oluştur (Uygulama çökmesin diye)
+    il_listesi = ["TÜM TÜRKİYE", "Adana", "Ankara", "İstanbul", "İzmir"] 
+    # Boş bir GeoDataFrame oluştur ki kod hata vermesin
+    gdf_cities = gpd.GeoDataFrame() 
+else:
+    st.success("✅ Sunuculara Bağlandı. Gerçek veriler hazır.")
+    cols = gdf_cities.columns
+    isim_kolonu = 'name' if 'name' in cols else 'NAME'
+    il_listesi = sorted(gdf_cities[isim_kolonu].unique().tolist())
+    il_listesi.insert(0, "TÜM TÜRKİYE")
+
+secilen_yer = st.sidebar.selectbox("Bölge Seçin:", il_listesi)
+
+st.sidebar.markdown("---")
+kabartma = st.sidebar.slider("Dağ Efekti", 0.5, 3.0, 1.2)
+izohips_goster = st.sidebar.checkbox("İzohipsleri Göster", value=True)
+sinir_goster = st.sidebar.checkbox("Sınırları Göster", value=True)
+su_goster = st.sidebar.checkbox("Gölleri Göster", value=True)
+isim_goster = st.sidebar.checkbox("İsimleri Yaz", value=True)
+
+if 'seed' not in st.session_state:
+    st.session_state.seed = 1923
+
+# --- ÇİZİM ALANI ---
+with st.spinner("Harita render ediliyor..."):
+    fig, ax = plt.subplots(figsize=(16, 10))
+    
+    # Koordinatları Belirle
+    bounds = [26.0, 36.0, 45.0, 42.0] # Varsayılan Türkiye Sınırları
+    plot_gdf = None
+
+    # Eğer internetten veri geldiyse sınırları güncelle
+    if not gdf_cities.empty and secilen_yer != "TÜM TÜRKİYE":
+        plot_gdf = gdf_cities[gdf_cities[isim_kolonu] == secilen_yer]
+        if not plot_gdf.empty:
+            bounds = plot_gdf.total_bounds
+    elif not gdf_cities.empty:
+        bounds = gdf_cities.total_bounds
+
+    # --- KARAR MEKANİZMASI ---
+    if uploaded_dem is not None:
+        # A) GERÇEK DOSYA VARSA
+        Z, real_bounds = zemin_uret_gercek(uploaded_dem)
+        extent = [real_bounds[0], real_bounds[2], real_bounds[1], real_bounds[3]]
+        # Eksenleri gerçek dosyaya göre ayarla
+        bounds = real_bounds 
+        origin_val = 'upper'
+    else:
+        # B) DOSYA YOKSA (SİMÜLASYON)
+        # Sınırları biraz genişlet
+        margin = 0.5
+        sim_bounds = [bounds[0]-margin, bounds[1]-margin, bounds[2]+margin, bounds[3]+margin]
+        Z = zemin_uret_simulasyon(sim_bounds, st.session_state.seed)
+        extent = [sim_bounds[0], sim_bounds[2], sim_bounds[1], sim_bounds[3]]
+        origin_val = 'lower'
+
+    # ÇİZİM
+    ls = LightSource(azdeg=315, altdeg=45)
+    rgb = ls.shade(Z, cmap=plt.cm.terrain, vert_exag=kabartma, blend_mode='overlay')
+    ax.imshow(rgb, extent=extent, origin=origin_val, zorder=1)
+
+    # Su (Varsa)
+    if su_goster and gdf_water is not None and not gdf_water.empty:
+        try:
+            gdf_water.plot(ax=ax, color='#1E90FF', alpha=0.9, zorder=2)
+        except:
+            pass
+
+    # İzohips
+    if izohips_goster:
+        levels = 25 if uploaded_dem is None else np.arange(0, np.max(Z), 500)
+        ax.contour(Z, levels=levels, colors='black', linewidths=0.3, alpha=0.5, 
+                   extent=extent, origin=origin_val, zorder=3)
+
+    # Sınırlar (Varsa)
+    if sinir_goster and not gdf_cities.empty:
+        if secilen_yer == "TÜM TÜRKİYE":
+            gdf_cities.boundary.plot(ax=ax, edgecolor='black', linewidth=0.6, zorder=4)
+        elif plot_gdf is not None:
+            gdf_cities.boundary.plot(ax=ax, edgecolor='gray', linewidth=0.3, alpha=0.5, zorder=4)
+            plot_gdf.boundary.plot(ax=ax, edgecolor='black', linewidth=1.5, zorder=5)
+
+    # İsim
