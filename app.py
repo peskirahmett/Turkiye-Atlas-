@@ -196,4 +196,4 @@ with st.spinner("Harita render ediliyor..."):
             gdf_cities.boundary.plot(ax=ax, edgecolor='gray', linewidth=0.3, alpha=0.5, zorder=4)
             plot_gdf.boundary.plot(ax=ax, edgecolor='black', linewidth=1.5, zorder=5)
 
-    # İsim
+    # Ahmet Peşkir
