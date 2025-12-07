@@ -13,10 +13,9 @@ from shapely.geometry import box
 # --- KÜTÜPHANE KONTROLÜ (HATA ÖNLEYİCİ) ---
 try:
     import rasterio
-    from rasterio.plot import show
     RASTERIO_VAR = True
 except ImportError:
-    RASTERIO_VAR = False  # Kütüphane yoksa not al, ama çökme!
+    RASTERIO_VAR = False
 
 # --- 1. SSL AYARLARI ---
 try:
@@ -35,15 +34,7 @@ st.title("🇹🇷 Ultimate Türkiye Atlası: Hibrit Mod")
 
 # Durum Bildirimi
 if not RASTERIO_VAR:
-    st.warning("⚠️ Sunucu 'rasterio' kütüphanesini yükleyemedi. **Gerçek TIF yükleme modu devre dışı.** Ancak Simülasyon Modu (Gerçek sınırlar ve göllerle) sorunsuz çalışıyor.")
-else:
-    st.success("✅ Tüm sistemler aktif (Rasterio Yüklü).")
-
-st.markdown("""
-Bu sistem **akıllı modda** çalışır:
-1. **Otomatik:** Açılışta gerçek sınırlar ve göller ile matematiksel topografyayı birleştirir.
-2. **Profesyonel:** (Aktifse) Sol taraftan `.tif` dosyası yüklerseniz gerçek NASA verisine geçer.
-""")
+    st.warning("⚠️ Sunucuda 'rasterio' yüklü değil. Gerçek TIF yükleme devre dışı, ancak **Simülasyon Modu** çalışıyor.")
 
 # --- 2. VERİ ÇEKME MOTORU ---
 @st.cache_data
@@ -102,14 +93,9 @@ def zemin_uret_gercek(uploaded_file):
         return None, None
         
     with rasterio.open(uploaded_file) as src:
-        # Performans için veriyi küçülterek oku (1/5 oranında)
         out_shape = (int(src.height / 5), int(src.width / 5))
         data = src.read(1, out_shape=out_shape, resampling=5)
-        
-        # Sınırları al
         bounds = rasterio.transform.array_bounds(src.height, src.width, src.transform)
-        
-        # Hatalı verileri düzelt
         data = np.where(data < -100, 0, data)
         return data, bounds
 
@@ -118,12 +104,10 @@ def zemin_uret_gercek(uploaded_file):
 # Yan Panel
 st.sidebar.header("🎛️ Kontrol Paneli")
 
-# Dosya Yükleyici (Sadece kütüphane varsa göster)
+# Dosya Yükleyici
 uploaded_dem = None
 if RASTERIO_VAR:
     uploaded_dem = st.sidebar.file_uploader("NASA .TIF Dosyası (Opsiyonel)", type=['tif', 'tiff'])
-else:
-    st.sidebar.error("Gerçek dosya yükleme modülü (Rasterio) sunucuda eksik.")
 
 # Verileri İndir
 with st.spinner("Harita verileri yükleniyor..."):
@@ -144,7 +128,108 @@ il_listesi.insert(0, "TÜM TÜRKİYE")
 secilen_yer = st.sidebar.selectbox("Bölge Seçin:", il_listesi)
 
 st.sidebar.markdown("---")
+# Ayarlar
 kabartma = st.sidebar.slider("Dağ Efekti", 0.5, 3.0, 1.2)
 izohips_goster = st.sidebar.checkbox("İzohipsleri Göster", value=True)
 sinir_goster = st.sidebar.checkbox("Sınırları Göster", value=True)
-su_goster = st.sidebar.checkbox("Gölleri Göster
+su_goster = st.sidebar.checkbox("Gölleri Göster", value=True)
+isim_goster = st.sidebar.checkbox("İsimleri Yaz", value=True)
+
+if 'seed' not in st.session_state:
+    st.session_state.seed = 1923
+
+# --- ÇİZİM ALANI ---
+with st.spinner("Harita render ediliyor..."):
+    fig, ax = plt.subplots(figsize=(16, 10))
+    
+    if secilen_yer == "TÜM TÜRKİYE":
+        plot_gdf = gdf_cities
+        title_text = "Türkiye Fiziki Haritası"
+    else:
+        plot_gdf = gdf_cities[gdf_cities[isim_kolonu] == secilen_yer]
+        title_text = f"{secilen_yer} İli Haritası"
+
+    target_bounds = plot_gdf.total_bounds 
+
+    # --- KARAR MEKANİZMASI ---
+    if uploaded_dem is not None and RASTERIO_VAR:
+        # GERÇEK MOD
+        Z, bounds = zemin_uret_gercek(uploaded_dem)
+        if Z is not None:
+            extent = [bounds[0], bounds[2], bounds[1], bounds[3]]
+            origin_val = 'upper'
+            st.success("✅ Gerçek NASA verisi kullanılıyor.")
+        else:
+            # Hata durumunda Simülasyon
+            margin = 0.2
+            sim_bounds = [target_bounds[0]-margin, target_bounds[1]-margin, 
+                          target_bounds[2]+margin, target_bounds[3]+margin]
+            Z, _ = zemin_uret_simulasyon(sim_bounds, st.session_state.seed)
+            extent = [sim_bounds[0], sim_bounds[2], sim_bounds[1], sim_bounds[3]]
+            origin_val = 'lower'
+    else:
+        # SİMÜLASYON MODU
+        margin = 0.2
+        sim_bounds = [target_bounds[0]-margin, target_bounds[1]-margin, 
+                      target_bounds[2]+margin, target_bounds[3]+margin]
+        Z, _ = zemin_uret_simulasyon(sim_bounds, st.session_state.seed)
+        extent = [sim_bounds[0], sim_bounds[2], sim_bounds[1], sim_bounds[3]]
+        origin_val = 'lower'
+
+    # 1. Topografya
+    ls = LightSource(azdeg=315, altdeg=45)
+    rgb = ls.shade(Z, cmap=plt.cm.terrain, vert_exag=kabartma, blend_mode='overlay')
+    ax.imshow(rgb, extent=extent, origin=origin_val, zorder=1)
+
+    # Zoom Alanı
+    viz_extent = [target_bounds[0]-0.2, target_bounds[2]+0.2, 
+                  target_bounds[1]-0.2, target_bounds[3]+0.2]
+
+    # 2. Su
+    if su_goster and gdf_water is not None:
+        try:
+            water_clip = gpd.clip(gdf_water, box(*viz_extent))
+            if not water_clip.empty:
+                water_clip.plot(ax=ax, color='#1E90FF', alpha=0.9, zorder=2)
+        except:
+            pass
+
+    # 3. İzohips
+    if izohips_goster:
+        levels = 25 if uploaded_dem is None else np.arange(0, np.max(Z), 500)
+        ax.contour(Z, levels=levels, colors='black', linewidths=0.3, alpha=0.5, 
+                   extent=extent, origin=origin_val, zorder=3)
+
+    # 4. Sınırlar
+    if sinir_goster:
+        if secilen_yer == "TÜM TÜRKİYE":
+            gdf_cities.boundary.plot(ax=ax, edgecolor='black', linewidth=0.6, zorder=4)
+        else:
+            gdf_cities.boundary.plot(ax=ax, edgecolor='gray', linewidth=0.3, alpha=0.5, zorder=4)
+            plot_gdf.boundary.plot(ax=ax, edgecolor='black', linewidth=1.5, zorder=5)
+
+    # 5. İsimler
+    if isim_goster:
+        target = gdf_cities if secilen_yer == "TÜM TÜRKİYE" else plot_gdf
+        for idx, row in target.iterrows():
+            centroid = row.geometry.centroid
+            if (centroid.x > viz_extent[0] and centroid.x < viz_extent[1] and
+                centroid.y > viz_extent[2] and centroid.y < viz_extent[3]):
+                
+                label = row[isim_kolonu]
+                fs = 6 if secilen_yer == "TÜM TÜRKİYE" else 11
+                txt = ax.text(centroid.x, centroid.y, label, fontsize=fs, ha='center', va='center', 
+                        color='black', fontweight='bold', zorder=6)
+                txt.set_path_effects([PathEffects.withStroke(linewidth=2, foreground='white')])
+
+    ax.set_xlim(viz_extent[0], viz_extent[1])
+    ax.set_ylim(viz_extent[2], viz_extent[3])
+    ax.set_aspect('equal')
+    ax.set_title(title_text, fontsize=15)
+    
+    st.pyplot(fig)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=300, bbox_inches='tight')
+    buf.seek(0)
+    st.download_button("💾 Resmi İndir", buf, "Harita.png", "image/png")
